@@ -1,0 +1,280 @@
+provider: deepseek
+base_url: https://chat.deepseek.com
+login_required: true
+user_data_dir: browser_profiles/deepseek
+
+global:
+  min_interval_sec: 1                # 操作最小间隔（秒）
+  slow_mo: 150
+  typing_min: 80
+  typing_max: 200
+
+# 能力声明
+capabilities:
+  modes:
+    - name: quick
+      default: true
+      features:
+        - name: upload
+          action: "upload_file_quick"
+      toggles:
+        - name: deep_think
+          action: "toggle_deep_think"
+          default: false
+        - name: internet_search
+          action: "toggle_internet_search"
+          default: false
+    - name: expert
+      features:
+        - name: upload
+          action: "upload_file_quick"
+      toggles:
+        - name: deep_think
+          action: "toggle_deep_think"
+          default: true
+    - name: vision
+      features:
+        - name: upload
+          action: "upload_file_vision"
+
+actions:
+  # ---------- 状态检查 ----------
+  is_logged_in:
+    action_type: any_visible
+    locate:
+      - placeholder: "给 DeepSeek 发送消息"
+      - text: "内容由AI生成，请仔细甄别"
+
+  is_sidebar_expanded:
+    action_type: any_visible
+    locate:
+      - css: "div._7d1f5e2[role='button']"
+      - css: "a[href^='/a/chat/s/']"
+
+  # ---------- 侧边栏控制 ----------
+  # 点击展开侧边栏（侧边栏收起时显示）
+  sidebar_expand_btn:
+    action_type: click
+    locate:
+      - css: "div._4f3769f[role='button']"
+      - css: "._4f3769f"
+
+  # 点击收起侧边栏（侧边栏展开时显示）
+  sidebar_collapse_btn:
+    action_type: click
+    locate:
+      - css: "div._7d1f5e2[role='button']"
+      - css: "._7d1f5e2"
+
+  # ---------- 会话列表交互 ----------
+  switch_conversation:
+    action_type: evaluate
+    script: |
+      (args) => {
+        const title = args.title;
+        const links = document.querySelectorAll('a._546d736');
+        for (const link of links) {
+          const titleDiv = link.querySelector('div.c08e6e93');
+          if (titleDiv && titleDiv.innerText.trim() === title) {
+            link.click();
+            return true;
+          }
+        }
+        throw new Error(`未找到标题为 "${title}" 的会话`);
+      }
+    wait_after: 300
+
+  current_conversation_menu:
+    action_type: click
+    locate:
+      - css: "a._546d736.b64fb9ae ._2090548[role='button']"
+    wait_after: 300
+
+  rename_option:
+    action_type: click
+    locate:      
+      - role: button
+        name: 重命名
+      - text: 重命名
+    wait_after: 300
+
+  rename_input:
+    action_type: fill
+    locate:
+      - role: textbox
+      - css: "input[type='text']"
+      - css: "[contenteditable='true']"
+    wait_after: 300
+
+  delete_option:
+    action_type: click
+    locate:      
+      - role: button
+        name: 删除
+      - text: 删除
+    wait_after: 300
+
+  delete_confirm_btn:
+    action_type: click
+    locate:
+      - text: 确定
+      - text: 确认
+      - text: Delete
+      - role: button
+        name: 确定
+    wait_after: 500
+
+  # chat交互
+  input_box:
+    action_type: fill
+    locate:
+      - placeholder: 给 DeepSeek 发送消息
+      - placeholder: 输入消息
+      - css: "textarea[placeholder*='给 DeepSeek 发送消息']"
+      - css: ".ds-scroll-area"
+
+  send_btn:
+    action_type: click
+    locate:
+      - role: button
+        name: 发送
+      - css: "button[aria-label*='发送']"
+
+  reply_area:
+    action_type: text
+    locate:
+      - css: "[class*='assistant']"
+      - css: ".message-assistant"
+    stable_wait: 3000
+
+  # ---------- 模式选择动作 ----------
+  new_chat_btn:
+    action_type: click
+    locate:
+      - text: 新会话
+      - text: 新对话
+      - role: button
+        name: 新对话
+    wait_after: 1500
+
+  select_quick_mode:
+    action_type: click
+    locate:
+      - text: "快速模式"
+      - css: "[data-mode='quick']"
+    wait_after: 1000
+
+  select_expert_mode:
+    action_type: click
+    locate:
+      - text: "专家模式"
+      - css: "[data-mode='expert']"
+    wait_after: 1000
+
+  select_vision_mode:
+    action_type: click
+    locate:
+      - text: "视物模式"
+      - text: "视觉模式"
+      - css: "[data-mode='vision']"
+    wait_after: 1000
+
+  # ---------- 开关切换 ----------
+  toggle_deep_think:
+    action_type: toggle
+    locate:
+      - text: 深度思考
+      - css: "[class*='deep-think']"
+      - css: "[aria-label*='深度思考']"
+    wait_after: 500
+
+  toggle_internet_search:
+    action_type: toggle
+    locate:
+      - text: 联网搜索
+      - css: "[class*='internet-search']"
+      - css: "[aria-label*='联网搜索']"
+    wait_after: 500
+
+  # ---------- 文件上传 ----------
+  upload_file_quick:
+    action_type: upload
+    locate:
+      - css: "input[type='file']"
+      - css: "[class*='upload']"
+
+  upload_file_vision:
+    action_type: upload
+    locate:
+      - css: "input[type='file'][accept*='image']"
+      - css: "input[type='file'][accept*='*']"
+
+  # ---------- 数据提取 ----------
+  current_conversation_title:
+    action_type: evaluate
+    script: "() => document.querySelector('a._546d736.b64fb9ae div.c08e6e93')?.innerText?.trim() || null"
+  
+  current_conversation_title1:
+    action_type: text
+    locate:
+      - css: "a._546d736.b64fb9ae div.c08e6e93"
+
+  # 获取会话列表
+  conversation_list:
+    action_type: evaluate
+    script: |
+      (args) => {
+        const titles = [];
+        const items = document.querySelectorAll('a._546d736 div.c08e6e93');
+        for (const el of items) {
+          const text = el.innerText?.trim();
+          if (text) titles.push(text);
+        }
+        return titles;
+      }
+
+  conversation_list1:
+    action_type: text
+    stable_wait: 2000
+    multiple: true
+    locate:
+      - css: "a._546d736 div.c08e6e93"
+
+  conversation_toplist:
+    action_type: evaluate
+    script: |
+      () => {
+        const groups = document.querySelectorAll('div._3098d02');
+        const titles = [];
+        for (const group of groups) {
+          const header = group.querySelector('div.f3d18f6a');
+          if (header && header.innerText.trim() === '置顶') {
+            const titleElements = group.querySelectorAll('a._546d736 div.c08e6e93');
+            for (const el of titleElements) {
+              const text = el.innerText?.trim();
+              if (text) titles.push(text);
+            }
+          }
+        }
+        return titles;
+      }
+
+  conversation_period_list:
+    action_type: evaluate
+    script: |
+      (args) => {
+        const groups = document.querySelectorAll('div._3098d02');
+        const titles = [];
+        for (const group of groups) {
+          const header = group.querySelector('div.f3d18f6a');
+          if (header && header.innerText.trim() === args.period) {
+            const titleElements = group.querySelectorAll('a._546d736 div.c08e6e93');
+            for (const el of titleElements) {
+              const text = el.innerText?.trim();
+              if (text) titles.push(text);
+            }
+          }
+        }
+        return titles;
+      }
+    
