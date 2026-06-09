@@ -2,9 +2,14 @@ import random
 import time
 import json
 import asyncio
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Callable
+from functools import wraps
 from playwright.async_api import Page, Locator
-from .exceptions import ElementNotFoundError, ActionConfigError
+from .exceptions import ElementNotFoundError, ActionConfigError, CallActionException, GetContentError, NotSupportedError
+
+import logging
+from .module_logger import setup_logging
+logger = setup_logging(loglevel=logging.INFO, logtag=__name__, bconsole=False, blogfile=True)
 
 DEFAULT_CONFIG_CONFIG = {
     "min_interval_sec": 1,
@@ -15,21 +20,12 @@ DEFAULT_CONFIG_CONFIG = {
 class ActionExecutor:
 
     _CHECKMODES = (
-        "any_visible",
-        "any_exists",
+        "any_visible",        
         "all_visible",
         "all_hidden",
         "any_hidden",
         "all_exists",
-    )
-    _EXTRACTORS = (
-        "text",
-        "value",
-        "attribute",
-        "inner_text",
-        "inner_html",
-        "outer_text",
-        "outer_html",
+        "any_exists",
     )
     """
     动作执行器 - 配置驱动的页面操作引擎
@@ -52,15 +48,6 @@ class ActionExecutor:
         # 操作时间跟踪
         self._last_action_time = 0
         self._last_message_time = 0
-    
-    def get_capabilities(self) -> dict:
-        """
-        返回提供者能力声明的原始字典
-        
-        Returns:
-            capabilities 字典，包含 modes、toggles 等
-        """
-        return self.capabilities
     
     async def _wait_interval(self, is_message_action: bool = False) -> None:
         """
@@ -95,149 +82,77 @@ class ActionExecutor:
         Returns:
             操作结果，可能是文本内容、布尔值或元素列表
         """
+        logger.info("===========")
+        logger.info(f"start action: {action_name}")
         await self._wait_interval()
         action_def = self.actions.get(action_name)
         if not action_def:
+            logger.error(f"未找到动作定义: {action_name}")
             raise ActionConfigError(f"未找到动作定义: {action_name}")
-        
-        # 检查是否需要跳过
-        skip_sel = action_def.get("skip_if_visible")
-        if skip_sel:
-            try:
-                skip_el = await self.page.query_selector(skip_sel)
-                if skip_el and await skip_el.is_visible():
-                    return None
-            except Exception:
-                pass
-        
+       
         action_type = action_def.get("action_type", "click")
-        print(f"executor-action: {action_name} ({action_type})")
+        logger.info(f"action_type: {action_type}")
         
-        # 特殊处理：extract_list 不需要定位单个元素
-        if action_type == "extract_list":
-            return await self._execute_extract_list(action_def)
-        
-        # 特殊处理：状态检查类动作
-        if action_type in self._CHECKMODES:
-            # return await self._execute_state_check(action_def, action_type)
-            return await self._check_state(action_def, action_type)
-
         # 定位元素
         if action_type != "evaluate":
             locate_strategies = action_def.get("locate", [])
             if not locate_strategies:
-                raise ActionConfigError(f"动作 '{action_name}' 缺少 locate 配置")
+                logger.error(f"'{action_name}' 非 evaluate 类型的动作  缺少 locate 配置")
+                raise ActionConfigError(f"非 evaluate 类型的动作 '{action_name}' 缺少 locate 配置")
 
         # 执行操作
         wait_after = action_def.get("wait_after", 0)
         multiple = action_def.get("multiple", False)
-        stable_wait = action_def.get("stable_wait", 0)
+        stable_wait = action_def.get("wait_stable", 0)
 
         if isinstance(stable_wait, dict):
             timeout_ms = stable_wait.get("timeout", 0)
-            locate_strategies = stable_wait.get("locator", None)
-            if not locate_strategies:
-                raise ActionConfigError(f"动作 '{action_name}' 缺少 stable_wait.locator 配置")
+            interval_ms = stable_wait.get("interval", 0)
+            wait_strategies = stable_wait.get("locate", None)
+            stable_count = stable_wait.get("stable_count", 1)
+            if not wait_strategies:
+                logger.error(f"{action_name} 的 wait_stable 缺少 locate 配置")
+                raise ActionConfigError(f"动作 '{action_name}' 的 wait_stable 缺少 locate 配置")
             if timeout_ms <= 0:
-                raise ActionConfigError(f"动作 '{action_name}' stable_wait.timeout 配置必须大于 0")
-            await self._do_stable_wait(action_name, locate_strategies, timeout_ms)
-        
-        # 合并配置参数和调用参数，调用参数优先（只合并必要的参数，避免冲突）
-        config_params = {}
-        for key in ["state_indicator", "attribute_name", "attribute"]:
-            if key in action_def:
-                config_params[key] = action_def[key]
-        
-        merged_params = config_params.copy()
-        merged_params.update(params)
-        
+                logger.error(f"动作 '{action_name}' 的 wait_stable 的 timeout 配置必须大于 0")
+                raise ActionConfigError(f"动作 '{action_name}' 的 wait_stable 的 timeout 配置必须大于 0")
+            # 替换参数中的变量
+            wait_strategies = self._replace_params(wait_strategies, params)
+            await self._do_stable_wait(action_name, wait_strategies, timeout_ms, interval_ms, stable_count)
+            stable_wait = -1
+
         result = None
-        if action_type == "evaluate":
+        # 特殊处理：状态检查类动作        
+        if action_type in self._CHECKMODES:
+            # return await self._execute_state_check(action_def, action_type)
+            result = await self._execute_state_check(action_def, action_type)
+
+        # 特殊处理：extract_list 不需要定位单个元素
+        elif action_type == "extract_list":
+            result = await self._execute_extract_list(action_def)        
+        
+        elif action_type == "evaluate":
             # 特殊处理 evaluate：可以直接使用 page.evaluate，不依赖 locator
-            result = await self._do_evaluate(action_def, **merged_params)            
-        else:            
+            result = await self._do_evaluate(action_name, action_def, **params)            
+        else:
+            locate_strategies = self._replace_params(locate_strategies, params)
             result = await self._execute_action(
                 action_type,
                 action_name,
                 locate_strategies,
                 multiple=multiple,
                 stable_wait=stable_wait,
-                **merged_params
+                action_def=action_def,
+                **params
             )
         
         # 额外等待
         if wait_after > 0:
-            await asyncio.sleep(wait_after / 1000)        
+            await asyncio.sleep(wait_after / 1000)
+        logger.info(f"end action: {action_name}")
+        logger.info("+++++++++++")
         
         return result
-
-    async def _do_evaluate(self, action_def: Dict[str, Any], **params) -> None:
-        """执行 evaluate 动作"""
-        script = action_def.get("script", "")
-        if not script:
-            raise ActionConfigError("evaluate 动作需要提供 script 参数")
-        # 直接将 params 作为参数传递给脚本（脚本应定义为接受一个参数的函数）
-        result = await self.page.evaluate(script, params)
-        return result
-    
-    async def _execute_state_check(self, action_def: Dict[str, Any], action_type: str) -> bool:
-        """执行状态检查动作"""
-        locate_strategies = action_def.get("locate", [])
-        if not locate_strategies:
-            return False
-        results = []
-
-        for strategy in locate_strategies:
-            try:
-                print(f"check strategy: {strategy}")
-                # is_visible = await self._is_visible_by_js(strategy)
-                # results.append(is_visible)
-                locator = self._build_locator(strategy)
-                is_visible = await asyncio.wait_for(locator.first.is_visible(), timeout=2.5) 
-                results.append(is_visible) 
-            except asyncio.TimeoutError:
-                print(f"check strategy {strategy} timeout")
-                results.append(False)
-            except Exception as e:
-                print(f"check strategy {strategy} error: {e}")
-                results.append(False)       
-
-        print(f"check strategies results: {results}")
-        if action_type == "any_visible":
-            return any(results)
-        elif action_type == "all_visible":
-            return all(results) if results else False
-        elif action_type == "any_hidden":
-            return any(not r for r in results)
-        elif action_type == "all_hidden":
-            return all(not r for r in results) if results else False
-        elif action_type == "any_exists":
-            return any(results)
-        elif action_type == "all_exists":
-            return all(results) if results else False
-        
-        return False
-
-    async def _do_stable_wait(self, action_name: str, strategies: List[Dict[str, Any]], timeout_ms: int) -> None:
-        """等待元素可见"""
-        max_retries = 3
-        base_delay = 0.5
-        locator_failed_count = 0
-
-        for attempt in range(max_retries):
-            for strategy in strategies:
-                locator = await self._locate_element(strategy, False)
-                if not locator:
-                    locator_failed_count += 1
-                    continue
-                await self._wait_for_stable(locator, timeout_ms)
-                return                
-
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-            
-        if locator_failed_count == len(strategies)*max_retries:
-            raise ActionConfigError(f"动作 '{action_name}' 所有选择器均失败，无法等待元素可见")
 
     async def _is_visible_by_js(self, strategy: Dict[str, Any]) -> bool:
         """使用纯 JavaScript 快速检查元素可见性，不等待动画，支持 CSS 和 XPath"""
@@ -274,8 +189,8 @@ class ActionExecutor:
                 return await locator.is_visible()
         
         except Exception as e:
-            print(f"JS 可见性检查失败 {strategy}: {e}")
-            return False
+            logger.error(f"JS 可见性检查失败 {strategy}: {e}")
+            raise e
 
     async def _is_element_visible_by_js(self, selector: str) -> bool:
         """通过 JS 立即检查元素是否存在且可见（不等待动画）"""
@@ -293,8 +208,8 @@ class ActionExecutor:
             """)
             return result
         except Exception as e:
-            print(f"JS 执行失败: {e}")
-            return False
+            logger.error(f"JS 执行失败: {e}")
+            raise e
    
     async def _execute_extract_list(self, action_def: Dict[str, Any]) -> List[Any]:
         """
@@ -306,9 +221,11 @@ class ActionExecutor:
         shared_fields = action_def.get("fields", [])
         
         if not container_config:
+            logger.error("extract_list 需要配置 container")
             raise ActionConfigError("extract_list 需要配置 container")
         
         if not item_configs:
+            logger.error("extract_list 需要配置 item")
             raise ActionConfigError("extract_list 需要配置 item")
         
         if isinstance(item_configs, dict):
@@ -316,6 +233,7 @@ class ActionExecutor:
         
         container_locate = container_config.get("locate", [])
         if not container_locate:
+            logger.error("extract_list 需要配置 container.locate")
             raise ActionConfigError("container 需要配置 locate")
         
         container_locator = None
@@ -328,6 +246,7 @@ class ActionExecutor:
                 continue
         
         if not container_locator:
+            logger.error("extract_list 容器元素未找到")
             raise ElementNotFoundError(
                 action_name="extract_list",
                 strategies=container_locate,
@@ -400,7 +319,8 @@ class ActionExecutor:
         if "testid" in strategy:
             return base_locator.get_by_test_id(strategy["testid"])
         
-        raise ActionConfigError(f"不支持的定位策略: {strategy}")
+        logger.error(f"不支持的定位策略: {strategy}")
+        raise NotSupportedError(f"不支持的定位策略: {strategy}")
     
     async def _extract_fields_from_item(self, item, fields_config: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """从列表项中提取多个字段"""
@@ -500,32 +420,43 @@ class ActionExecutor:
         elif action_type in ("exists",):
             return True
         return None
-    
-    async def _locate_element(self, strategy: Dict[str, Any], multiple: bool = False) -> Union[Locator, List[Locator], None]:
-        """
-        使用多策略定位元素
-        
-        Args:
-            strategy: 定位策略
-            multiple: 是否返回多个元素，默认 False
-            
-        Returns:
-            Locator 实例或列表，根据 multiple 参数返回
-        """
-       
-        print(f"尝试策略: {strategy}")
-        try:
-            locator = self._build_locator(strategy)
-            # 等待元素可见
-            # await locator.wait_for(state="attached", timeout=5000)
 
-            count = await locator.count()
-            print(f"匹配元素数量: {count}")
-            if count > 0:
-                if multiple:
-                    return locator
-                else:
-                    return locator.first
+    def _replace_params(self, obj, params):
+        if isinstance(obj, dict):
+            return {k: self._replace_params(v, params) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._replace_params(i, params) for i in obj]
+        elif isinstance(obj, str):
+            # 替换 {key} 为 params 中的值
+            import re
+            def repl(match):
+                key = match.group(1)
+                return str(params.get(key, match.group(0)))
+            return re.sub(r'\{([^}]+)\}', repl, obj)
+        else:
+            return obj
+
+    async def _locate_element(self, strategy: Dict[str, Any], multiple: bool = False) -> Locator:
+        logger.debug(f"尝试策略: {strategy}")
+        locator = self._build_locator(strategy)
+        index = strategy.get("index", 0)
+        # 等待元素可见
+        # await locator.wait_for(state="attached", timeout=5000)
+        if index < -1:
+            logger.error(f"{strategy} 索引 {index} 无效")
+            raise ActionConfigError(f"{strategy} 索引 {index} 无效")
+
+        count = await locator.count()
+        logger.debug(f"匹配元素数量: {count}")
+        if count > 0:
+            if multiple:
+                return locator
+            elif index == 0 or index == "first":
+                return locator.first
+            elif index == count - 1 or index == -1 or index == "last":
+                return locator.last
+            else:
+                return locator.nth(index)
 
             # if "css" in strategy:
             #     await self.page.wait_for_selector(strategy["css"], state="attached", timeout=5000)
@@ -540,10 +471,8 @@ class ActionExecutor:
             #     print(f"匹配元素数量: {count}")
             #     if count > 0:
             #         return locator
-        except Exception as e:
-            print(f"策略 {strategy} 失败: {str(e)}")
-
-        return None
+        logger.error(f"未找到元素: {strategy}")
+        raise ActionConfigError(f"未找到元素: {strategy}")
     
     def _build_locator(self, strategy: Dict[str, Any]) -> Locator:
         """根据策略构建 Playwright Locator"""
@@ -572,59 +501,13 @@ class ActionExecutor:
         if "testid" in strategy:
             return self.page.get_by_test_id(strategy["testid"])
         
+        logger.error(f"不支持的定位策略: {strategy}")
         raise ActionConfigError(f"不支持的定位策略: {strategy}")
     
-    async def _execute_action(
-        self,
-        action_type: str,
-        action_name: str,
-        strategies: List[Dict[str, Any]],
-        multiple: bool = False,
-        stable_wait: int = 0,
-        **params
-    ) -> Any:
-        max_retries = 3
-        base_delay = 0.5
-        locator_failed_count = 0
-        actor_failed_count = 0
-
-        for attempt in range(max_retries):
-            for strategy in strategies:
-                locator = await self._locate_element(strategy, multiple)
-
-                if not locator:
-                    locator_failed_count += 1
-                    continue
-
-                if stable_wait > 0 and not multiple:
-                    if multiple:
-                        raise ActionConfigError(f"多元素等待使用stable_wait的locate参数")
-                    await self._wait_for_stable(locator, stable_wait)                
-                
-                try:
-                    return await self._do_action(locator, action_type, multiple, params)
-                except ActionConfigError as e:
-                    print(f"操作配置错误: {str(e)}")
-                    raise e
-                except ElementNotFoundError as e:
-                    print(f"元素未找到: {str(e)}")
-                    actor_failed_count += 1
-                    continue
-                except Exception as e:
-                    print(f"操作失败: {str(e)}")
-                    actor_failed_count += 1
-                    continue
-
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
-        if locator_failed_count == len(strategies)*max_retries:
-            raise ElementNotFoundError(f"{action_name}所有定位策略均失败: {strategies}")
-        if actor_failed_count == len(strategies)*max_retries:
-            raise ActionConfigError(f"{action_name}所有操作策略均失败: {strategies}")
-
-    async def _do_action(self, locator: Locator, action_type: str, multiple: bool, params: Dict) -> Any:
+    async def _do_action(self, locator: Locator, action_type: str, multiple: bool, params: Dict, action_def: Dict[str, Any])  -> Any:
         """执行具体操作"""
+        action_args = action_def.get("args", [])
+
         if action_type == "click":
             if multiple:
                 elements = await locator.all()
@@ -633,16 +516,22 @@ class ActionExecutor:
                     return elements
                 return []
             await locator.click()
-            return None
+            return True
         
         if action_type == "dblclick":
             await locator.dblclick()
-            return None
+            return True
         
-        if action_type == "fill":
-            value = params.get("value", "")
+        if action_type == "fill":            
+            if not action_args:
+                logger.error("fill操作需要定义args参数")
+                raise ActionConfigError("fill操作需要定义args参数")
+            value = params.get(action_args[0], "")
+            if not value:
+                logger.error(f"fill操作需要参数: {action_args[0]}")
+                raise CallActionException(f"fill操作需要字典形式传递参数: {action_args[0]}")
             await locator.fill(value)
-            return None
+            return True
         
         if action_type == "type":
             value = params.get("value", "")
@@ -653,15 +542,18 @@ class ActionExecutor:
                 delay = random.randint(typing_min, typing_max)
                 await locator.type(char, delay=delay)
                 await asyncio.sleep(delay / 1000)
-            return None
+            return True
         
         if action_type == "press":
-            key = params.get("key", "Enter")
+            key = action_def.get("key", "Enter")
+            if not key:
+                logger.error("press操作需要配置key参数")
+                raise ActionConfigError("press操作需要配置key参数")
             await locator.press(key)
-            return None
+            return True
         
         if action_type == "wait":
-            return None
+            return True
         
         if action_type == "check":
             try:
@@ -685,27 +577,28 @@ class ActionExecutor:
         
         if action_type == "focus":
             await locator.focus()
-            return None
+            return True
         
         if action_type == "scroll_into_view":
             await locator.scroll_into_view_if_needed()
-            return None
+            return True
         
         if action_type == "select_option":
             value = params.get("value", "")
             await locator.select_option(value)
-            return None
+            return True
         
         if action_type == "clear":
             await locator.clear()
-            return None
+            return True
         
         # 数据提取操作
         if action_type in ("text", "text_content"):
             if multiple:
                 texts = []
-                for element in await locator.all():
-                    texts.append(await element.inner_text())
+                elements = await locator.all()
+                for element in elements:
+                    texts.append(await element.inner_text(timeout=0))
                 return texts
             return await locator.inner_text()
         
@@ -713,7 +606,18 @@ class ActionExecutor:
             return await locator.inner_html()
         
         if action_type in ("attribute", "get_attribute"):
-            attr_name = params.get("attribute_name", params.get("attribute", ""))
+            attr_name = action_def.get("attribute_name", "")
+            if not attr_name:
+                logger.error("attribute操作需要配置attribute_name参数")
+                raise ActionConfigError("attribute操作需要配置attribute_name参数")
+            raw_value = action_def.get("value", None)            
+            if raw_value is not None:
+                value = raw_value.lower() == "true" if isinstance(raw_value, str) else bool(raw_value)
+                logger.debug(f"获取属性：{attr_name}，判断值：{value}")
+                current_state = await locator.get_attribute(attr_name)
+                current_enabled = current_state == "true"
+                logger.debug(f"当前属性值：{current_enabled}")
+                return current_enabled == value
             return await locator.get_attribute(attr_name)
         
         if action_type == "count":
@@ -733,48 +637,72 @@ class ActionExecutor:
                 return await locator.is_enabled()
             except Exception:
                 return False
-        
-        if action_type == "evaluate":
-            script = params.get("script", "")
-            return await locator.evaluate(script)
-        
+      
         if action_type == "upload":
-            file_path = params.get("file_path", "")
+            file_path = params.get(action_args[0]) if action_args else ""
             if not file_path:
-                raise ActionConfigError("upload 操作需要提供 file_path 参数")
+                logger.error("upload 调用需要提供 file_path 参数")
+                raise CallActionException("upload 调用需要提供 file_path 参数")
             await locator.set_input_files(file_path)
-            return None
+            return True
         
         if action_type == "toggle":
-            state_indicator = params.get("state_indicator", "aria-pressed")
-            enable = params.get("enable", True)
+            state_indicator = action_def.get("state_indicator", "aria-pressed")
+            raw_enable = params.get("enable", True)
+            enable = raw_enable.lower() == "true" if isinstance(raw_enable, str) else bool(raw_enable)
+            logger.debug(f"切换状态：{state_indicator}，期待值：{enable}")
             
             current_state = await locator.get_attribute(state_indicator)
             current_enabled = current_state == "true"
+            logger.debug(f"当前状态：{current_enabled}")
             
             if current_enabled != enable:
                 await locator.click()
             
             return current_enabled != enable
         
-        raise ActionConfigError(f"不支持的操作类型: {action_type}")
+        logger.error(f"不支持的操作类型: {action_type}")
+        raise NotSupportedError(f"不支持的操作类型: {action_type}")
     
-    async def _wait_for_stable(self, locator: Locator, timeout_ms: int) -> bool:
+    async def _wait_for_stable(self, locator: Locator, timeout_ms: int, interval_ms: int = 200, stable_count: int = 1) -> bool:
         """等待元素稳定（内容不再变化）"""
         start_time = time.time()
+        interval_sec = interval_ms / 1000
         timeout_sec = timeout_ms / 1000
         last_content = None
+        stable_count = stable_count
+        if stable_count <= 0:
+            stable_count = 1
+        equal_count = 0
         
-        while time.time() - start_time < timeout_sec:
+        while time.time() - start_time < timeout_sec or equal_count == 0:
+            await self._ensure_full_render(locator)
             try:
-                content = await locator.inner_text()
+                content = await locator.inner_html()
+                # logger.debug(f"{locator} 内容: {content}")
                 if content == last_content:
-                    return True
+                    equal_count += 1
+                    if equal_count >= stable_count:
+                        return True
+                else:
+                    equal_count = 0
                 last_content = content
-            except Exception:
+            except Exception as e:
+                logger.error(f"{locator}获取 inner_html 内容时出错: {e}")
                 pass
-            await asyncio.sleep(0.5)
-        return False
+            await asyncio.sleep(interval_sec)
+        raise GetContentError(f"{locator} 内容未稳定，超时 {timeout_sec} 秒")
+
+    async def _ensure_full_render(self, locator: Locator):
+        """滚动到元素底部，强制加载所有懒加载内容"""
+        await locator.evaluate("""
+            (el) => {
+                el.scrollTop = el.scrollHeight;
+                // 或者滚动页面
+                // window.scrollTo(0, document.body.scrollHeight);
+            }
+        """)
+        await asyncio.sleep(0.5)  # 等待新内容加载
     
     async def _get_available_elements(self) -> Dict[str, List[str]]:
         """获取页面上可用的元素信息（用于诊断）"""
@@ -795,53 +723,154 @@ class ActionExecutor:
         except Exception:
             pass
         
-        return elements
+        return elements    
 
-    async def _check_state(self, action_def: Dict, action_type: str, max_retries: int = 3, retry_delay: float = 0.5) -> bool:
-        """
-        通用状态检查函数，支持重试机制
-        
-        Args:
-            action_def: 操作定义字典
-            action_type: 检查模式
-                - "any_visible": 任一元素可见即返回 True
-                - "any_exists": 任元素存在即返回 True
-                - "all_visible": 所有元素都可见返回 True
-                - "all_hidden": 所有元素都隐藏返回 True
-                - "any_hidden": 任一元素隐藏返回 True
-                - "all_exists": 所有元素都存在返回 True
-            max_retries: 最大重试次数
-            retry_delay: 重试间隔（秒）
-        
-        Returns:
-            布尔值，表示状态是否满足检查模式
-        """
-        for attempt in range(max_retries):
-            # 首先检查 actions 中是否有同名的状态检查动作
-            print(f"\ntry {attempt+1}/{max_retries}")
-            result = await self._execute_state_check(action_def, action_type)
-            if result:
-                return True
-            elif attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-                attempt += 1
+    @staticmethod
+    def _try_count(max_retries: int, interval_ms: int) -> Callable:
+        def decorator(func):
+            @wraps(func)
+            async def wapper_func(self, *args, **kwargs):
+                for attempt in range(max_retries):
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as e:
+                        logger.error(f"error: {e}\ntry {attempt+1}/{max_retries} ")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(interval_ms / 1000)
+                        else:
+                            raise e
+            return wapper_func
+        return decorator
+
+    @_try_count(max_retries=3, interval_ms=500)
+    async def _do_stable_wait(self, action_name: str, strategies: List[Dict[str, Any]], 
+                timeout_ms: int, interval_ms: int, stable_count: int) -> None:
+        """等待元素可见""" 
+        for strategy in strategies:
+            try:
+                locator = await self._locate_element(strategy, False)
+            except Exception as e:
+                logger.error(f"wait strategy {strategy} error: {e}")
                 continue
-            return result
-        return False
-    
-    async def check_sidebar_expanded(self) -> bool:
-        """
-        检查侧边栏是否展开（快捷方法）
-        
-        Returns:
-            布尔值，侧边栏是否展开
-        """
-        # 优先检查收起状态（如果收起状态可见，直接返回 False）
-        collapsed = await self.check_state("sidebar_collapsed", check_mode=CheckMode.ANY_VISIBLE)
-        if collapsed:
+            if not locator:
+                continue
+            await self._wait_for_stable(locator, timeout_ms, interval_ms, stable_count)
+            return
+        logger.error(f"{action_name} 等待元素可见失败, strategies: {strategies}")
+        raise ActionConfigError(f"{action_name} 等待元素可见失败, strategies: {strategies}")
+
+    @_try_count(max_retries=3, interval_ms=500)
+    async def _execute_state_check(self, action_def: Dict[str, Any], action_type: str) -> bool:
+        """执行状态检查动作"""
+        locate_strategies = action_def.get("locate", [])
+        multiple = action_def.get("multiple", False)
+        if not locate_strategies:
             return False
+        results = []
+
+        for strategy in locate_strategies:
+            try:
+                # is_visible = await self._is_visible_by_js(strategy)
+                # results.append(is_visible)
+                locator = await self._locate_element(strategy, multiple)
+                is_visible = await asyncio.wait_for(locator.is_visible(), timeout=2.5) 
+                results.append(is_visible) 
+            except asyncio.TimeoutError:
+                logger.error(f"check strategy {strategy} timeout")
+                continue
+            except Exception as e:
+                logger.error(f"check strategy {strategy} error: {e}")
+                continue
         
-        # 然后检查展开状态
-        expanded = await self.check_state("sidebar_expanded", check_mode=CheckMode.ANY_VISIBLE)
-        return expanded
+        if len(results) != len(locate_strategies):
+            logger.warning(f"check strategies results: {results}, strategies: {locate_strategies}, results len: {len(results)}, strategies len: {len(locate_strategies)}")
+            logger.warning("exist strategies not match results")
+
+        if not results or ("all" in action_type and len(results) != len(locate_strategies)):
+            logger.error(f"{action_type} 检查失败, 策略数量与结果数量不匹配")
+            raise ActionConfigError(f"{action_type} 检查失败, 策略数量与结果数量不匹配, results:{results}, strategies:{locate_strategies}")
+ 
+        if action_type == "any_visible":
+            return any(results)
+        elif action_type == "all_visible":
+            return all(results) if results else False
+        elif action_type == "any_hidden":
+            return any(not r for r in results)
+        elif action_type == "all_hidden":
+            return all(not r for r in results) if results else False
+        elif action_type == "any_exists":
+            return any(results)
+        elif action_type == "all_exists":
+            return all(results) if results else False
+        
+        return False
+
+    async def _do_evaluate(self, action_name: str, action_def: Dict[str, Any], **params) -> Any:
+        """执行 evaluate 动作"""
+        logger.debug(f"_do_evaluate: {action_name}")
+        script = action_def.get("script", "")
+        if not script:
+            logger.error("evaluate 动作需要提供 script 配置")
+            raise ActionConfigError("evaluate 动作需要提供 script 配置")
+        
+        # logger.debug(f"evaluate script: {script}")        
+        # 直接将 params 作为参数传递给脚本（脚本应定义为接受一个参数的函数）
+        # print(f"evaluate script: {script} with params: {params}")
+        MAX_TRY = 3
+        for try_count in range(MAX_TRY):
+            try:
+                result = await self.page.evaluate(script, params)
+                logger.debug(f"evaluate result: {result}")
+                return result
+            except Exception as e:
+                logger.warning(f"evaluate error try {try_count}, error: {e}\n wait {try_count+1}/{MAX_TRY}, continue...")
+                if try_count == MAX_TRY - 1:
+                    logger.error(f"{action_name} evaluate script 失败, error: {e}")
+                    raise e
+                await asyncio.sleep(0.5)
+
+    @_try_count(max_retries=3, interval_ms=500)
+    async def _execute_action(
+        self,
+        action_type: str,
+        action_name: str,
+        strategies: List[Dict[str, Any]],
+        multiple: bool = False,
+        stable_wait: int = 0,
+        action_def: Dict[str, Any] = {},
+        **params
+    ) -> Any:
+        logger.debug(f"_execute_action开始执行操作: {action_name}")
+        for strategy in strategies:
+            try:
+                locator = await self._locate_element(strategy, multiple)
+            except Exception as e:
+                logger.error(f"{strategy} 定位元素失败, error: {str(e)}")
+                continue
+
+            if not locator:
+                continue
+
+            if stable_wait > 0:
+                try:
+                    if multiple:
+                        logger.error("locator.count > 1, 不支持多元素等待使用stable_wait的locate参数")
+                        continue
+                    await self._wait_for_stable(locator, stable_wait)
+                except Exception as e:
+                    logger.error(f"{action_name} 等待元素稳定失败, error: {str(e)}")
+                    continue
+            
+            try:
+                return await self._do_action(locator, action_type, multiple, params, action_def)
+            except ActionConfigError as e:
+                print(f"操作配置错误: {str(e)}")
+                raise e
+            except ElementNotFoundError as e:
+                print(f"元素未找到: {str(e)}")
+                continue
+            except Exception as e:
+                logger.error(f"操作失败: {str(e)}")
+                continue
+        raise ActionConfigError(f"{action_name} 操作失败, 所有策略均失败")
 

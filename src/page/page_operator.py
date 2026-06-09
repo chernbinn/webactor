@@ -6,7 +6,11 @@ from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright
 
 from .action_executor import ActionExecutor
-from .exceptions import ConfigNotFoundException, ConfigLoadError
+from .exceptions import ConfigNotFoundException, ConfigLoadError, LoginRequiredException
+
+import logging
+from .module_logger import setup_logging
+logger = setup_logging(loglevel=logging.DEBUG, logtag=__name__, bconsole=True, blogfile=True)
 
 DEFAULT_PROFILE_BASE_DIR = os.path.expanduser(os.path.join(os.path.expanduser("~"), ".pageactor"))
 DEFAULT_SLOW_MO = 150
@@ -56,9 +60,10 @@ class PageOperator:
             self.page = self.browser_context.pages[0]
         else:
             self.page = await self.browser_context.new_page()
+        self.page.set_default_timeout(15000)
         
         await self.page.goto(self.base_url, wait_until="domcontentloaded")
-        
+
         self.executor = ActionExecutor(
             page=self.page,
             actions=self.actions,
@@ -101,6 +106,15 @@ class PageOperator:
                 return await self.executor.execute(action_name, **params)
             raise RuntimeError("PageOperator 尚未启动")
 
+    def get_capabilities(self) -> dict:
+        """
+        返回提供者能力声明的原始字典
+        
+        Returns:
+            capabilities 字典，包含 modes、toggles 等
+        """
+        return self.capabilities.copy()
+
     # 子类可以重写此方法，实现具体的登录逻辑
     async def wait_for_login(self, timeout: int = 300, check_interval: int = 3):
         """
@@ -111,7 +125,7 @@ class PageOperator:
             check_interval: 检查间隔（秒），默认 3 秒
         
         Raises:
-            RuntimeError: 登录超时时抛出异常
+            LoginRequiredException: 登录超时时抛出异常
         """        
         elapsed = 0
         while elapsed < timeout:
@@ -121,13 +135,14 @@ class PageOperator:
                 if is_logged:
                     return
             except Exception as e:
-                raise RuntimeError(f"检查登录状态时出错: {str(e)}")
+                logger.error(f"检查登录状态时出错: {str(e)}")
+                raise e
             
             # 等待一段时间后再次检查
             await asyncio.sleep(check_interval)
             elapsed += check_interval
         
-        raise RuntimeError(f"登录超时，等待 {timeout} 秒后仍未检测到登录状态")
+        raise LoginRequiredException(f"登录超时，等待 {timeout} 秒后仍未检测到登录状态")
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载 YAML 配置文件"""
@@ -146,15 +161,4 @@ class PageOperator:
         login_state = await self.execute("is_logged_in")
         if not login_state:
             await self.wait_for_login()
-
-    def _get_toggle_action(self, toggle_name: str, mode: str) -> Optional[str]:
-        """获取指定模式的开关动作名"""
-        modes = self.capabilities.get("modes", [])
-        for m in modes:
-            if m["name"] == mode:
-                toggles = m.get("toggles", [])
-                for toggle in toggles:
-                    if toggle["name"] == toggle_name:
-                        return toggle.get("action")
-        return None
 
